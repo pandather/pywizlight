@@ -92,6 +92,13 @@ def states_match(old: Dict[str, Any], new: Dict[str, Any]) -> bool:
     return True
 
 
+def _dual_head_state_index(device: Any) -> Optional[int]:
+    """Convert a WiZ dual-head device number to a state list index."""
+    if isinstance(device, int) and not isinstance(device, bool) and 1 <= device <= 2:
+        return device - 1
+    return None
+
+
 def _rgb_in_range_or_raise(rgb: Tuple[Union[float, int], ...]) -> None:
     if not (0 <= rgb[0] < 256):
         raise ValueError("Red is not in range between 0-255.")
@@ -655,19 +662,47 @@ class wizlight:
     def _on_push(self, resp: dict, addr: Tuple[str, int]) -> None:
         """Handle a syncPilot from the device."""
         self.history.message(HISTORY_PUSH, resp)
+        new_state = resp["params"]
+        if self.bulbtype and self.bulbtype.features.dual_head:
+            state_index = _dual_head_state_index(new_state.get("devices"))
+            is_zoned = len(self.state) > 1
+            current_state = self.state[0] if self.state else None
+            is_ratio = not is_zoned and (
+                new_state.get("ratio") is not None
+                or (current_state is not None and current_state.get_ratio() is not None)
+            )
+            if is_ratio:
+                self.last_push = time.monotonic()
+                old_state = current_state.pilotResult if current_state else None
+                if old_state and states_match(old_state, new_state):
+                    return
+                self.state = [PilotParser(new_state)]
+                if self.push_callback:
+                    self.push_callback(self.state)
+                return
+            if state_index is not None:
+                self.last_push = time.monotonic()
+                while len(self.state) < 2:
+                    self.state.append(None)
+                old_head_state = self.state[state_index]
+                old_state = old_head_state.pilotResult if old_head_state else None
+                if old_state and states_match(old_state, new_state):
+                    return
+                self.state[state_index] = PilotParser(new_state)
+                if self.push_callback:
+                    self.push_callback(self.state)
+                return
+            if is_zoned:
+                _LOGGER.debug(
+                    "%s: Ignoring dual-head push without a valid devices index",
+                    self.ip,
+                )
+                return
+
         self.last_push = time.monotonic()
         old_state = self.state[0].pilotResult if self.state and self.state[0] else None
-        new_state = resp["params"]
         if old_state and states_match(old_state, new_state):
             return
-        if self.bulbtype and self.bulbtype.features.dual_head:
-            # For dual head, push updates might be partial or ambiguous.
-            # We avoid corrupting the list-based state and force a refresh.
-            self.last_push = 0
-            if self.push_callback:
-                self.push_callback(self.state)
-            return
-
         self.state = [PilotParser(new_state)]
         if self.push_callback:
             self.push_callback(self.state)
@@ -899,27 +934,68 @@ class wizlight:
         """
 
         if self.last_push + MAX_TIME_BETWEEN_PUSH < time.monotonic():
+            last_push_before_poll = self.last_push
             if self.bulbtype is None:
                 await self.get_bulbtype()
+                if self.last_push != last_push_before_poll:
+                    return self.state
 
-            new_state: List[Optional[PilotParser]] = []
-            if self.bulbtype and self.bulbtype.features.dual_head:
-                for heads in range(2):
-                    method = {"method": "getPilot", "params": {"devices": heads}}
-                    resp = await self.send(method)
-                    if resp is not None and "result" in resp:
-                        head_state = PilotParser(resp["result"])
-                    else:
-                        head_state = None
-                    new_state.append(head_state)
-            # Without heads
+            resp = await self.send({"method": "getPilot", "params": {}})
+            if self.last_push != last_push_before_poll:
+                return self.state
+            if resp is not None and "result" in resp:
+                state = PilotParser(resp["result"])
             else:
-                resp = await self.send({"method": "getPilot", "params": {}})
-                if resp is not None and "result" in resp:
-                    single_state = PilotParser(resp["result"])
-                else:
-                    single_state = None
-                new_state.append(single_state)
+                state = None
+
+            if not self.bulbtype or not self.bulbtype.features.dual_head:
+                self.state = [state]
+                return self.state
+
+            is_zoned = len(self.state) > 1
+            current_state = self.state[0] if len(self.state) == 1 else None
+            current_state_is_ratio = (
+                current_state is not None and current_state.get_ratio() is not None
+            )
+            if not is_zoned and (
+                (state is not None and state.get_ratio() is not None)
+                or (state is None and current_state_is_ratio)
+            ):
+                self.state = [state]
+                return self.state
+
+            new_state: List[Optional[PilotParser]] = (
+                self.state[:2] if is_zoned else [None, None]
+            )
+            while len(new_state) < 2:
+                new_state.append(None)
+            existing_first_index = (
+                _dual_head_state_index(new_state[0].pilotResult.get("devices"))
+                if new_state[0]
+                else None
+            )
+            if state is not None and existing_first_index is None:
+                new_state[0] = state
+
+            for state_index in range(2):
+                try:
+                    indexed_resp = await self.send(
+                        {"method": "getPilot", "params": {"devices": state_index}}
+                    )
+                except (WizLightConnectionError, WizLightTimeOutError):
+                    if self.last_push != last_push_before_poll:
+                        return self.state
+                    break
+                if self.last_push != last_push_before_poll:
+                    return self.state
+                indexed_result = (
+                    indexed_resp.get("result") if indexed_resp is not None else None
+                )
+                if not isinstance(indexed_result, dict):
+                    continue
+                indexed_state = PilotParser(indexed_result)
+                if _dual_head_state_index(indexed_result.get("devices")) == state_index:
+                    new_state[state_index] = indexed_state
             self.state = new_state
         return self.state
 
